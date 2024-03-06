@@ -1,4 +1,4 @@
-# Invariant Shape Representation Learning (Code)
+# Invariant Shape Representation Learning (ISRL)
 
 
 This repository provides the PyTorch implementation of the paper, *Invariant Shape Representation Learning (ISRL)*
