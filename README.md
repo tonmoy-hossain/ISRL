@@ -1,1 +1,1 @@
-# ISRL
+# Invariant Shape Representation Learning (Code)
