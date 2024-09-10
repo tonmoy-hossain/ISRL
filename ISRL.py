@@ -1,21 +1,21 @@
-import argparse
-import numpy as np
 import torch
 from torchvision import datasets
 from torch import nn, optim, autograd
 import torch.nn.functional as F
 from matplotlib import pyplot as plt
 
+import argparse
+import numpy as np
+
 from typing import Union, List, Tuple
 
 import importlib
-
+import pickle
 import dataloading
 importlib.reload(dataloading)
-from dataloading import get_mnist_traintest_reg_data, normalize_img
-from dataloading import get_mnist_traintest_reg_data, normalize_img, MNIST_Dataset, MNIST_Dataset_Direct
-from dataloading import ADNI_Dataset, get_adni_traintest_imagevel_data, get_adni_traintest_image_data_direct, get_adni_traintest_reg_data, visualize_dataloader
 
+from dataloading import get_mnist_traintest_reg_data, normalize_img, MNIST_Dataset, MNIST_Dataset_Direct
+from dataloading import ADNI_Dataset, get_adni_traintest_imagevel_data, get_adni_traintest_image_data_direct, get_adni_traintest_reg_data
 
 import SimpleITK as sitk
 from skimage.transform import resize
@@ -29,189 +29,18 @@ from scipy.special import softmax
 
 import models
 importlib.reload(models)
-from models import FCNModel, CNNModel, JointCNNModel, initialize_encoder_classifier
-from networks import loss_Reg, loss_Reg_2D, get_reg_net
-from torchinfo import summary as torchinfo_summary
-from torchsummary import summary
+from models import FCNModel, CNNModel, JointCNNModel
+from network_epdiff_ISRL import loss_Reg, loss_Reg_2D, get_reg_net
 import os
 
 
-
-channels = 1
+channels = 3
 dim = 224
-batch_size = 8
-dev = 'cuda'
-num_classes = 2
-dims = (104, 128, 120)
-lr = 0.001
-epochs = 200
-# dims = (224, 224, 224)
-# dims = (224, 224)
+num_classes = 3
+sigma = 0.01
 
-
-class MLP(nn.Module):
-    def __init__(self, hidden_dim, n_classes, grayscale_model=False):
-        super(MLP, self).__init__()
-        self.hidden_dim = hidden_dim
-        self.n_classes = n_classes
-        self.grayscale_model = grayscale_model
-        if self.grayscale_model:
-            lin1 = nn.Linear(dim * dim, self.hidden_dim)
-        else:
-            lin1 = nn.Linear(channels * dim * dim, self.hidden_dim)
-        lin2 = nn.Linear(self.hidden_dim, self.hidden_dim)
-        lin3 = nn.Linear(self.hidden_dim, self.n_classes)
-        for lin in [lin1, lin2, lin3]:
-            nn.init.xavier_uniform_(lin.weight)
-            nn.init.zeros_(lin.bias)
-        self._main = nn.Sequential(lin1, nn.ReLU(True), lin2, nn.ReLU(True), lin3)
-
-    def forward(self, input):
-        if self.grayscale_model:
-            out = input.reshape(input.shape[0], 1, dim * dim).sum(dim=1)
-        else:
-            out = input.reshape(input.shape[0], channels * dim * dim)
-        out = self._main(out)
-        return out
-
-
-def mean_nll(logits, y):
-    return nn.functional.cross_entropy(logits, y)
-
-
-def mean_accuracy(logits, y):
-    preds = torch.argmax(logits, dim=1).float()
-    return (preds == y).float().mean()
-
-
-def penalty(logits, y):
-    scale = torch.ones((1, logits.size(-1))).cuda().requires_grad_()
-    loss = mean_nll(logits * scale, y)
-    grad = autograd.grad(loss, [scale], create_graph=True)[0]
-    return torch.sum(grad ** 2)
-
-
-def pretty_print(*values):
-    col_width = 13
-
-    def format_val(v):
-        if not isinstance(v, str):
-            v = np.array2string(v, precision=5, floatmode='fixed')
-        return v.ljust(col_width)
-
-    str_values = [format_val(v) for v in values]
-    print("   ".join(str_values))
-    
-    
-
-def read_images_path_list_coloring(path_list, labels_names_colors, add_grayscale_channel):
-#     path_list, labels_names_colors = data[keyword], data[f'{keyword}_labels_names_colors']
-    colors = np.array(labels_names_colors)[:,2].astype(int)
-    
-    channel = 3
-    if add_grayscale_channel:
-        channel = 4
-    
-    images = torch.zeros(len(path_list), 2, channel, dim, dim)
-    for i in range(len(path_list)):
-        paths = path_list[i]
-        X_channels = []
-
-        for p in paths: # filename_src, filename_tar OR filename_image, filename_vel...
-            itkimage = sitk.ReadImage(p)
-            img = sitk.GetArrayFromImage(itkimage)
-            img = normalize_img(img)
-            X_channels.append(np.expand_dims(img, 0)) # bring channel forward, add 1 for concatenate so = (1,3,128,128)
-
-        X = torch.zeros(2, channel, dim, dim)
-        X[:,colors[i],:,:] = torch.tensor(np.concatenate(X_channels))
-        
-        if add_grayscale_channel:
-            grayscale = X.sum(axis=1)
-            X[:,-1,:,:] = grayscale
-            
-        images[i] = X
-
-    return images
-
-def create_env_loaders(add_grayscale_channel=False):
-    envs = []
-    
-    data = get_mnist_traintest_reg_data()
-    
-    for keyword in ['train1', 'train2', 'test']:
-        print(keyword)
-        images = read_images_path_list_coloring(data[keyword], data[f'{keyword}_labels_names_colors'], add_grayscale_channel)        
-        loader = torch.utils.data.DataLoader(MNIST_Dataset_Direct(images=images, labels_names_colors=data[f'{keyword}_labels_names_colors']), batch_size=batch_size, shuffle=True, num_workers=0)
-    
-#         mnist_dataset = MNIST_Dataset(image_paths=data[keyword], labels_names_colors=data[f'{keyword}_labels_names_colors'], channels=num_classes, dims=(dim, dim))
-#         loader = torch.utils.data.DataLoader(mnist_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
-    
-        envs.append({'loader':loader})
-        
-    return envs
-
-
-def create_env_loaders_adni(modalities='image', is_joint=False):
-    envs = []
-    for e in [0, 1, 2]:    
-        if is_joint:
-            data = get_adni_traintest_reg_data(only_env=e)
-        else:
-            data = get_adni_traintest_image_data_direct(only_env=e)
-        
-        clf_trainloader_env = torch.utils.data.DataLoader(ADNI_Dataset(image_paths=data['train'], 
-                                                                       labels_names_ages=data['train_labels_names_ages']), 
-                                                          batch_size=batch_size, shuffle=True, num_workers=0)
-        envs.append({'loader':clf_trainloader_env})
-    
-    
-    if is_joint:
-        data = get_adni_traintest_reg_data()
-    else:
-        data = get_adni_traintest_image_data_direct()
-    
-    clf_testloader_env = torch.utils.data.DataLoader(ADNI_Dataset(image_paths=data['test'], 
-                                                                  labels_names_ages=data['test_labels_names_ages']), shuffle=False, 
-                                                     batch_size=batch_size, num_workers=0)
-    
-    envs.append({'loader':clf_testloader_env})
-
-    return envs
-
-
-def create_within_env_loaders_adni(e, modalities='image', is_joint=False):
-    envs = []
-    
-    if is_joint:
-        data = get_adni_traintest_reg_data(only_env=e)
-    else:
-        data = get_adni_traintest_image_data_direct(only_env=e)
-
-    clf_trainloader_env = torch.utils.data.DataLoader(ADNI_Dataset(image_paths=data['train'], 
-                                                                   labels_names_ages=data['train_labels_names_ages']), 
-                                                      batch_size=batch_size, shuffle=True, num_workers=0)
-    envs.append({'loader':clf_trainloader_env})
-
-
-    clf_testloader_env = torch.utils.data.DataLoader(ADNI_Dataset(image_paths=data['test'], 
-                                                                  labels_names_ages=data['test_labels_names_ages']), shuffle=False, 
-                                                     batch_size=batch_size, num_workers=0)
-
-    envs.append({'loader':clf_testloader_env})
-
-    return envs
-
-
-#### Visualize Brain Slices ####
-
-# envs = create_env_loaders_adni(is_joint=True)   
-# envs = create_within_env_loaders_adni(0, is_joint=True)
-
-# print('\nPrepared environments:')
-# for env in envs:
-#     print(len(env['loader'])*batch_size)
-# visualize_dataloader(env['loader'])
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
 
 
 from sklearn.metrics import f1_score, auc, precision_score, recall_score, roc_auc_score, roc_curve, classification_report, accuracy_score, top_k_accuracy_score
@@ -226,35 +55,15 @@ def evaluate_pred(y_true, y_pred, y_prob):
     print(y_true[:100])
     print(y_pred[:100])
 
-    #metrics = [train_loss, train_acc, res[0], res[1], f1_score(y_true, y_pred), precision_score(y_true, y_pred), recall_score(y_true, y_pred), roc_auc]
     precision = precision_score(y_true, y_pred, average='macro')
     recall = recall_score(y_true, y_pred, average='macro')
     f1score = f1_score(y_true, y_pred, average='macro')
     acc_score = accuracy_score(y_true, y_pred)
 
-#     y_bin_prob = softmax(y_prob, axis=1)[:,1]
     y_bin_prob = np.max(softmax(y_prob, axis=1), 1)
-
-    
-    top_1_acc = 0 #top_k_accuracy_score(y_true, y_bin_prob, k=1)
-    top_5_acc = 0 #top_k_accuracy_score(y_true, y_bin_prob, k=5)
-    roc_auc = 0 #roc_auc_score(y_true, y_bin_prob)
     
     mdf = pd.DataFrame([[acc_score, precision, recall, f1score]], columns=['Accuracy', 'Precision', 'Recall', 'F1-Score']).T
     print(mdf)
-    
-#     RocCurveDisplay.from_predictions(
-#         y_true,
-#         y_bin_prob,
-#         name=f"1 vs 0",
-#         color="darkorange",
-#     )
-#     plt.plot([0, 1], [0, 1], "k--", label="chance level (AUC = 0.5)")
-#     plt.axis("square")
-#     plt.xlabel("False Positive Rate")
-#     plt.ylabel("True Positive Rate")
-#     plt.legend()
-#     plt.show()
     
     return mdf, (y_true, y_pred, y_bin_prob)
 
@@ -272,20 +81,10 @@ def evaluate_reg_classifier(net, classifier, testloader, do_fuse=False, just_cnn
         for j, (images, labels, name, env) in enumerate(testloader):
             images = images.to(dev)
             labels = labels.to(dev)
-
-            ##        2d
-#         b, m, c, w, h = images.shape
-#         src_img = images[:,0,...].reshape(b,c,w,h)
-#         tar_img = images[:,1,...].reshape(b,c,w,h) 
-#         src_img_gray = src_img.sum(axis=1).reshape(b,1,w,h)
-#         tar_img_gray = tar_img.sum(axis=1).reshape(b,1,w,h)
-
-            b, c, w, h, d = images.shape
-            src_img = images[:,0,...].reshape(b,1,w,h,d)
-            tar_img = images[:,1,...].reshape(b,1,w,h,d) 
-            src_img_gray = src_img
-            tar_img_gray = tar_img
-
+            b, m, c, w, h = images.shape # m for modalities - src/tar, c for rgb =3 
+            src_img = images[:,0,...].reshape(b,c,w,h)
+            tar_img = images[:,1,...].reshape(b,c,w,h)     
+            
             if grayscale_model:
                 tar_img = tar_img.sum(dim=1, keepdim=True)
                 
@@ -294,6 +93,10 @@ def evaluate_reg_classifier(net, classifier, testloader, do_fuse=False, just_cnn
                 pred_labels = classifier(tar_img)
 
             else: # joint / FCN with registration
+                # convert_to_grayscale
+                src_img_gray = src_img.sum(axis=1).reshape(b,1,w,h)
+                tar_img_gray = tar_img.sum(axis=1).reshape(b,1,w,h)
+
                 pred = net(src_img_gray, tar_img_gray, registration = True)
                 reg_latent = pred[2]
 
@@ -315,8 +118,137 @@ def evaluate_reg_classifier(net, classifier, testloader, do_fuse=False, just_cnn
 
     m, y = evaluate_pred(y_true, y_pred, y_prob)
     return m, y
+
+
+
+##### Data Loading from Scratch for both 2D and 3D datasets ######
+######## We already provided envs.pkl file under datasets.zip. Please use that to get a headstart ########
+
+batch_size = 32
+dev = 'cuda'
+
+num_classes = 3
+dim = 224
+channel = 3
+
+def read_images_path_list_coloring(path_list, labels_names_colors, add_grayscale_channel):
+#     path_list, labels_names_colors = data[keyword], data[f'{keyword}_labels_names_colors']
+    colors = np.array(labels_names_colors)[:,2].astype(int)
+    
+    channel = 3
+    if add_grayscale_channel:
+        channel = 4
+    
+    images = torch.zeros(len(path_list), 2, channel, dim, dim)
+    for i in range(len(path_list)):
+        paths = path_list[i]
+        X_channels = []
+
+        for p in paths: # filename_src, filename_tar OR filename_image, filename_vel...
+            itkimage = sitk.ReadImage(p)
+            img = sitk.GetArrayFromImage(itkimage)
+            img = normalize_img(img)
+    #             img = resize(img, (dim, dim))
+            X_channels.append(np.expand_dims(img, 0)) # bring channel forward, add 1 for concatenate so = (1,3,128,128)
+
+        X = torch.zeros(2, channel, dim, dim) # color source same as target
+        X[:,colors[i],:,:] = torch.tensor(np.concatenate(X_channels))
+        
+        if add_grayscale_channel:
+            grayscale = X.sum(axis=1)#.unsqueeze(dim=1)
+#             print(X.shape, grayscale.shape)
+            X[:,-1,:,:] = grayscale
+            
+        images[i] = X
+
+    return images
+
+def create_env_loaders(add_grayscale_channel=False):
+    envs = []
+    
+    data = get_mnist_traintest_reg_data()
+    
+    for keyword in ['train1', 'train2', 'test']:
+        print(keyword)
+        images = read_images_path_list_coloring(data[keyword], data[f'{keyword}_labels_names_colors'], add_grayscale_channel)        
+        loader = torch.utils.data.DataLoader(MNIST_Dataset_Direct(images=images, labels_names_colors=data[f'{keyword}_labels_names_colors']), batch_size=batch_size, shuffle=False, num_workers=0)
+    
+#         mnist_dataset = MNIST_Dataset(image_paths=data[keyword], labels_names_colors=data[f'{keyword}_labels_names_colors'], channels=num_classes, dims=(dim, dim))
+#         loader = torch.utils.data.DataLoader(mnist_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    
+        envs.append({'loader':loader})
+        
+    return envs
+
+def create_env_loaders_adni(modalities='image', is_joint=False):
+    envs = []
+    for e in [0, 1, 2]:    
+        if is_joint:
+            data = get_adni_traintest_reg_data(only_env=e)
+        else:
+            data = get_adni_traintest_image_data_direct(only_env=e)
+        
+        clf_trainloader_env = torch.utils.data.DataLoader(ADNI_Dataset(image_paths=data['train'], 
+                                                                       labels_names_ages=data['train_labels_names_ages']), 
+                                                          batch_size=batch_size, shuffle=False, num_workers=0)
+        envs.append({'loader':clf_trainloader_env})
     
     
+    if is_joint:
+        data = get_adni_traintest_reg_data()
+    else:
+        data = get_adni_traintest_image_data_direct()
+    
+    clf_testloader_env = torch.utils.data.DataLoader(ADNI_Dataset(image_paths=data['test'], 
+                                                                  labels_names_ages=data['test_labels_names_ages']), shuffle=False, 
+                                                     batch_size=batch_size, num_workers=0)
+    
+    envs.append({'loader':clf_testloader_env})
+
+    return envs
+
+# envs = create_env_loaders_adni()    
+
+# print('\nPrepared environments:')
+# for env in envs:
+#     print(len(env['loader'])*batch_size)
+
+# envs = create_env_loaders()    
+
+# print('\nPrepared environments:')
+# for env in envs:
+#     print(len(env['loader'])*batch_size)
+
+
+# Save variable data to a file
+# with open("/scratch/pwg7jb/envs_3k.pkl", "wb") as file:
+#     pickle.dump(envs, file)
+
+# Load variable data from the file
+with open("/scratch/pwg7jb/envs_3k.pkl", "rb") as file:
+    envs = pickle.load(file)
+    
+
+    
+#### Pretty Print ####
+class objectview(object):
+    def __init__(self, d):
+        self.__dict__ = d
+
+            
+def pretty_print(*values):
+    col_width = 13
+    def format_val(v):
+        if not isinstance(v, str):
+            v = np.array2string(v, precision=5, floatmode='fixed')
+        return v.ljust(col_width)
+    str_values = [format_val(v) for v in values]
+    print("   ".join(str_values))
+    
+    
+   
+##### ERM/IRM classes #####
+
 class CNN_IRM: 
     def __init__(self, model, lr, wd, flags):
         self.flags = flags
@@ -326,24 +258,17 @@ class CNN_IRM:
         
     def forward_pass(self, images, labels):
         images = images.to(dev)
-        b, c, w, h, d = images.shape
-        src_img = images[:,0,...].reshape(b,1,w,h,d)
-        tar_img = images[:,1,...].reshape(b,1,w,h,d)
-        
-#         b, m, c, w, h = images.shape
+        b, m, c, w, h = images.shape
 
-#         src_img = images[:,0,...].reshape(b,c,w,h)
-#         tar_img = images[:,1,...].reshape(b,c,w,h)        
+        src_bch = images[:,0,...].reshape(b,c,w,h)
+        tar_bch = images[:,1,...].reshape(b,c,w,h)        
         
         if self.grayscale_model:
-            tar_img = tar_img.sum(dim=1, keepdim=True)
+            tar_bch = tar_bch.sum(dim=1, keepdim=True)
         
-        logits = self.model(tar_img)    
+        logits = self.model(tar_bch)    
     
         loss = mean_nll(logits, labels) 
-        
-#         print('cnn-loss: ', loss)
-#         print('not joint loss')
         
         return logits, loss
     
@@ -354,8 +279,6 @@ class CNN_IRM:
         if flags.use_phi_params:
             params = self.model.classifier.parameters()
             
-            
-#         for w in self.model.parameters(): # change to clf params
         for w in params: # change to clf params
             weight_norm += w.norm().pow(2)
         return weight_norm
@@ -404,14 +327,7 @@ class CNN_IRM:
                     env['nll'] = total_loss
                     env['penalty'] = penalty(logits, labels)
         
-                    env['acc'] = mean_accuracy(logits, labels) # (predicted == orig_labels).sum() / labels.shape[0]  # mean_accuracy(logits, labels)
-
-#                 !nvidia-smi
-
-                # mean of training environments
-#                 train_nll = torch.stack([envs[0]['nll'], envs[1]['nll'], envs[2]['nll']]).mean()
-#                 train_acc = torch.stack([envs[0]['acc'], envs[1]['acc'], envs[2]['acc']]).mean()
-#                 train_penalty = torch.stack([envs[0]['penalty'], envs[1]['penalty'], envs[2]['penalty']]).mean()
+                    env['acc'] = mean_accuracy(logits, labels) 
                 
                 train_nll = torch.stack([envs[i]['nll'] for i in range(flags.n_envs)]).mean()
                 train_acc = torch.stack([envs[i]['acc'] for i in range(flags.n_envs)]).mean()
@@ -425,37 +341,12 @@ class CNN_IRM:
                 pw = (self.flags.penalty_weight if step >= self.flags.penalty_anneal_iters else 1.0)
                 loss += pw * train_penalty # pen
                 if pw > 1.0:
-                  # Rescale the entire loss to keep gradients in a reasonable range
                   loss /= pw
-                
-#                 print('---check weight update---')
-#                 self.optimizer.zero_grad()
-#                 loss.backward(retain_graph=True)
-#                 self.optimizer.step()
-            
-#                 if step >= self.flags.pre_train:
-#                     self.optimizer_clf.zero_grad()
-#                     loss.backward(retain_graph=True)
-#                     self.optimizer_clf.step()
-#                 else:
-#                     self.optimizer_net.zero_grad()
-#                     loss.backward(retain_graph=True)
-#                     self.optimizer_net.step()
                     
 
                 self.optimizer_clf.zero_grad()
                 loss.backward(retain_graph=True)
                 self.optimizer_clf.step()
-
-#                 self.optimizer_net.zero_grad()
-#                 loss.backward(retain_graph=True)
-#                 self.optimizer_net.step()
-                
-#                 model_prm_1 = list(self.net.parameters())[0].clone()
-#                 clf_prm_1 = list(self.classifier.parameters())[0].clone()
-                
-#                 print('Reg parameter: ', torch.equal(model_prm.data, model_prm_1.data))
-#                 print('Clf parameter', torch.equal(clf_prm.data, clf_prm_1.data))
     
                 test_acc = envs[-1]['acc']
         
@@ -485,6 +376,7 @@ class CNN_IRM:
         return final_train_accs
 
 
+
 class Joint_IRM(CNN_IRM): 
     def __init__(self, net, classifier, lr, reg_error_func, alpha=0.1, beta=0.1, wd=0, flags=None): # reg net and classifier
         self.net = net
@@ -499,32 +391,23 @@ class Joint_IRM(CNN_IRM):
         
     def forward_pass(self, images, labels):
         images = images.to(dev)
+        b, m, c, w, h = images.shape
+        src_img = images[:,0,...].reshape(b,c,w,h)
+        tar_img = images[:,1,...].reshape(b,c,w,h) 
         
-##        2d
-#         b, m, c, w, h = images.shape
-#         src_img = images[:,0,...].reshape(b,c,w,h)
-#         tar_img = images[:,1,...].reshape(b,c,w,h) 
-#         src_img_gray = src_img.sum(axis=1).reshape(b,1,w,h)
-#         tar_img_gray = tar_img.sum(axis=1).reshape(b,1,w,h)
-
-        b, c, w, h, d = images.shape
-        src_img = images[:,0,...].reshape(b,1,w,h,d)
-        tar_img = images[:,1,...].reshape(b,1,w,h,d) 
-        src_img_gray = src_img
-        tar_img_gray = tar_img
+        src_img_gray = src_img.sum(axis=1).reshape(b,1,w,h)
+        tar_img_gray = tar_img.sum(axis=1).reshape(b,1,w,h)
         
-    
         pred = self.net(src_img_gray, tar_img_gray, registration = True)
 
         reg_latent = pred[2]
-        
-        pred_label = self.classifier((tar_img, reg_latent)) #reg_latent->pred[1]
-    
+        pred_label = self.classifier((tar_img, reg_latent))
         clf_loss = mean_nll(pred_label, labels)
         
-        reg_loss = self.reg_criterion(pred[0], tar_img_gray) + self.alpha*self.reg_error_func(pred[1])
+        regularization = (pred[3]*pred[4]).sum() / (tar_img_gray.numel())
+        reg_loss = self.reg_criterion(pred[0], tar_img_gray)/(sigma*sigma) + 0.01*regularization
         
-        loss_total = reg_loss + clf_loss
+        loss_total = clf_loss + reg_loss
 #         if self.epoch >= self.flags.pre_train:
 #             loss_total = reg_loss + clf_loss
 #         else:
@@ -554,39 +437,32 @@ class Joint_IRM(CNN_IRM):
         self.net.eval()
         self.classifier.eval()
         
-        
+dims = (224, 224)
 rnet = get_reg_net(dims=dims, nb_unet_features=[[16, 32, 32], [32, 32, 16, 16]])
-summary(model=rnet, input_size=[(1,*dims), (1, *dims)])
-reg_dim = np.prod(ms.summary_list[17].output_size) 
+reg_dim=25088
 
 flags = {
         'dims': dims,
+        'hidden_dim': 256,
         'n_restarts': 1,
-    
-        'l2_regularizer_weight': 0.000110794568,
+        'l2_regularizer_weight': 0.00110794568,
         'penalty_anneal_iters': 5,
-        'penalty_weight': 10000,
-    
-        'grayscale_model': False, 
+        'penalty_weight': 50000,
+        'grayscale_model': False, ###############
         'steps': 501,   
-      
-        'channels': 1,
+        'num_classes': 3,
+        'channels': 3,
         'n_envs': len(envs)-1,
         'use_phi_params': False,
-        
-        'num_classes': 2,
-        'is_2d': False,
-        'reg_error_func': loss_Reg,
-
+        'is_2d': True,
+    
         # for joint training
         'reg_dim': reg_dim,
         'pre_train': 5
 }
-flags = objectview(flags) # access dict key attributes with .
-
+flags = objectview(flags) 
 
 def run_erm_irm(flags, erm, lr = 0.004898536566546834, epochs = 10, is_joint=False, encoder_type='custom'):
-#     torch.manual_seed(0)
     
     print('grayscale_model: ', flags.grayscale_model)
 
@@ -604,14 +480,15 @@ def run_erm_irm(flags, erm, lr = 0.004898536566546834, epochs = 10, is_joint=Fal
     model_irm = None
     
     if is_joint:
-        rnet = get_reg_net(flags.dims, [[16, 16, 32], [32, 32, 16, 16]])
+        rnet = get_reg_net(flags.dims, [[16, 32, 32], [32, 32, 16, 16]])
         #     net = get_reg_net(dims, para.model.nb_unet_features)
         print(rnet.unet_model.encoder) # get shape here
         
-        model = JointCNNModel(channels=flags.channels, dims=flags.dims, num_classes=flags.num_classes, op='add', reg_dim=reg_dim, is_2d=flags.is_2d, encoder_type=encoder_type).to(dev)  # replace add with cat and use linear layer
+        model = JointCNNModel(channels=flags.channels, dims=flags.dims, num_classes=flags.num_classes, op='cat', reg_dim=reg_dim, is_2d=flags.is_2d, encoder_type=encoder_type).to(dev) 
         
-        model_irm = Joint_IRM(net=rnet, classifier=model, lr=lr, reg_error_func=flags.reg_error_func, wd=0, flags=flags)
+        model_irm = Joint_IRM(net=rnet, classifier=model, lr=lr, reg_error_func=loss_Reg_2D, wd=0, flags=flags)
     else:
+    #     model = MLP(hidden_dim=flags.hidden_dim, n_classes=flags.num_classes, grayscale_model=flags.grayscale_model).to(dev)
         model = CNNModel(dims=flags.dims, channels=flags.channels, num_classes=flags.num_classes, is_2d=flags.is_2d, encoder_type=encoder_type).to(dev)  
         model_irm = CNN_IRM(model, lr=lr, wd=0, flags=flags)
     
@@ -626,26 +503,27 @@ def run_erm_irm(flags, erm, lr = 0.004898536566546834, epochs = 10, is_joint=Fal
         trained_model = model_irm.get_models()[0]
         return trained_model
 
+
     
+CUDA_LAUNCH_BLOCKING=1
+
 metrics = []
+lr = 0.00005
+epochs = 15
 
-encoder_type='custom'
-model_name = f'{encoder_type}_disjoint_irm_adni'
+model_name = 'resnet_irm'
+encoder_type = 'resnet'
 
-for i in range(epochs):
+for i in range(100):
     torch.manual_seed(0)
     print('================================',i,'================================\n')
-## ONLY DISJOINT
-    model = run_erm_irm(flags, erm=True, lr=lr, epochs=epochs, is_joint=False, encoder_type=encoder_type)
+    model = run_erm_irm(flags, erm=False, lr=lr, epochs = epochs, encoder_type=encoder_type)
     m, p = evaluate_reg_classifier(None, model, envs[-1]['loader'], just_cnn=True, do_fuse=False, is_joint=False, grayscale_model=flags.grayscale_model)
-#     torch.save(rnet, os.path.join('saved_models', model_name+'_rnet.h5'))
+    # rnet, model = run_erm_irm(flags, erm=True, lr=lr, epochs = epochs, is_joint=True, encoder_type=encoder_type)
+    # m, p = evaluate_reg_classifier(rnet, model, envs[-1]['loader'], just_cnn=False, do_fuse=True, is_joint=True, grayscale_model=flags.grayscale_model)
 
-## JOINT
-#     rnet, model = run_erm_irm(flags, erm=False, lr=lr, epochs = epochs, is_joint=True, encoder_type=encoder_type)
-#     m, p = evaluate_reg_classifier(rnet, model, envs[-1]['loader'], just_cnn=False, do_fuse=True, is_joint=True, grayscale_model=flags.grayscale_model)
-
-#     torch.save(rnet, os.path.join('saved_models', model_name+'_rnet.h5'))
-#     torch.save(model, os.path.join('saved_models', model_name+'_model.h5'))
+    # torch.save(rnet, os.path.join('', str(i) + model_name+'_rnet.pth'))
+    # torch.save(model, os.path.join('', str(i) + model_name+'_model.pth'))
     
     metrics.append(m)
 
@@ -653,3 +531,4 @@ print('lr: ', lr,  'epochs: ', epochs, 'penalties: ', flags.penalty_anneal_iters
 df_metrics = pd.concat(metrics, axis=1)
 print('mean\n', df_metrics.mean(axis=1))
 print('std\n', df_metrics.std(axis=1))
+df_metrics
