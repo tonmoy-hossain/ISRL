@@ -25,3 +25,14 @@ To install the lagomorph, please direct to [https://github.com/jacobhinkle/lagom
 
 ## Dataset
 * Please download the Google QuickDraw dataset from https://github.com/googlecreativelab/quickdraw-dataset and run quickdrawGen.py to get the colored version of QuickDraw Dataset
+
+
+## Training and Testing
+* Run ISRL.py file
+* For intensity-based ERM, set erm=True, just_cnn=True, do_fuse=False, is_joint=False
+```
+model = run_erm_irm(flags, erm=False, lr=lr, epochs = epochs, encoder_type=encoder_type)
+m, p = evaluate_reg_classifier(None, model, envs[-1]['loader'], just_cnn=True, do_fuse=False, is_joint=False, grayscale_model=flags.grayscale_model)
+```
+* For intensity-based IRM, set erm=False, just_cnn=True, do_fuse=False, is_joint=False
+* For intensity+shape ERM, 
