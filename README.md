@@ -23,5 +23,5 @@ Geometric shape features have been widely used as strong predictors for image cl
 To install the lagomorph, please direct to [https://github.com/jacobhinkle/lagomorph](https://github.com/jacobhinkle/lagomorph)
 
 
-## Dataset and pre-trained models
+## Dataset
 * We have provided training and testing samples of the Google QuickDraw dataset in the *datasets.zip* file, and for consistency, we used these samples for both training and testing (envs[-1])
