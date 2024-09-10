@@ -29,10 +29,13 @@ To install the lagomorph, please direct to [https://github.com/jacobhinkle/lagom
 
 ## Training and Testing
 * Run ISRL.py file
-* For intensity-based ERM, set erm=True, just_cnn=True, do_fuse=False, is_joint=False
+* For intensity-based ERM (erm=True)/IRM (erm=False), set the following lines in the ISRL.py
 ```
-model = run_erm_irm(flags, erm=False, lr=lr, epochs = epochs, encoder_type=encoder_type)
+model = run_erm_irm(flags, erm=True/False, lr=lr, epochs = epochs, encoder_type=encoder_type)
 m, p = evaluate_reg_classifier(None, model, envs[-1]['loader'], just_cnn=True, do_fuse=False, is_joint=False, grayscale_model=flags.grayscale_model)
 ```
-* For intensity-based IRM, set erm=False, just_cnn=True, do_fuse=False, is_joint=False
-* For intensity+shape ERM, 
+* For intensity+shape ERM (erm=True) or ISRL (erm=False), set the following lines in the ISRL.py
+```
+rnet, model = run_erm_irm(flags, erm=True/False, lr=lr, epochs = epochs, is_joint=True, encoder_type=encoder_type)
+m, p = evaluate_reg_classifier(rnet, model, envs[-1]['loader'], just_cnn=False, do_fuse=True, is_joint=True, grayscale_model=flags.grayscale_model)
+```
