@@ -24,4 +24,4 @@ To install the lagomorph, please direct to [https://github.com/jacobhinkle/lagom
 
 
 ## Dataset
-* We have provided training and testing samples of the Google QuickDraw dataset in the *datasets.zip* file, and for consistency, we used these samples for both training and testing (envs[-1])
+* Please download the Google QuickDraw dataset from https://github.com/googlecreativelab/quickdraw-dataset and run quickdrawGen.py to get the colored version of QuickDraw Dataset
