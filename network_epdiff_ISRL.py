@@ -4,9 +4,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions.normal import Normal
-# from . import layers
 from layers import *
 from modelio import LoadableModel, store_config_args
+import torch.nn.init as init
+import torch.optim as optim
+from modelio import LoadableModel, store_config_args
+from EpdiffLib import Epdiff
+import lagomorph as lm
+
+
 
 if torch.cuda.is_available():
     dev = "cuda"
@@ -180,8 +186,6 @@ class Unet(nn.Module):
             if not self.half_res or level < (self.nb_levels - 2):
 
                 x = self.upsampling[level](x)
-                # print ('shape1:', x.shape)
-                # print ('shape2:', x_history.pop().shape)
                 x = torch.cat([x, x_history.pop()], dim=1)
                 
 
@@ -262,6 +266,13 @@ class DiffeoDense(LoadableModel):
 
         # configure transformer
         self.transformer = SpatialTransformer(inshape)
+        
+        self.alpha = 2.0
+        self.gamma = 1.0
+
+        self.MEpdiff = Epdiff(alpha=self.alpha, gamma=self.gamma)
+        self.fluid_params = [self.alpha, 0, self.gamma]
+        self.metric = lm.FluidMetric(self.fluid_params)
 
     def forward(self, source, target, registration=False):
 
@@ -270,37 +281,20 @@ class DiffeoDense(LoadableModel):
         x,latent_f = self.unet_model(x)
 
         # transform into flow field
-        flow_field = self.flow(x)
+        x = self.flow(x).permute(0, 2, 3, 1)
 
-        # resize flow for integration
-        pos_flow = flow_field
-        if self.resize:
-            pos_flow = self.resize(pos_flow)
-
-        preint_flow = pos_flow
-        # negate flow for bidirectional model
-        neg_flow = -pos_flow if self.bidir else None
-
-        # integrate to produce diffeomorphic warp
-        if self.integrate:
-            pos_flow = self.integrate(pos_flow)
-            neg_flow = self.integrate(neg_flow) if self.bidir else None
-
-            # resize to final resolution
-            if self.fullsize:
-                pos_flow = self.fullsize(pos_flow)
-                neg_flow = self.fullsize(neg_flow) if self.bidir else None
-
-        # warp image with flow field
-        y_source = self.transformer(source, pos_flow)
-        y_target = self.transformer(target, neg_flow) if self.bidir else None
-
-        # return non-integrated flow field if training
+        m = x               
+        v = self.metric.sharp(m) 
+        u_seq, v_seq, m_seq, ui_seq = \
+            self.MEpdiff.my_expmap( m, num_steps=self.TSteps)
+        u = u_seq[-1]
+        ui = ui_seq[-1]
+        Sdef = lm.interp(src, u)
+        
         if not registration:
             return (y_source, y_target, preint_flow) if self.bidir else (y_source, preint_flow)
         else:
-            return y_source, pos_flow, latent_f
-
+            return Sdef, v, latent_f, v, m, u
 
 class ConvBlock(nn.Module):
 
